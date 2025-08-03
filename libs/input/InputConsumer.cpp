@@ -779,12 +779,13 @@ void InputConsumer::popConsumeTime(uint32_t seq) {
 }
 
 status_t InputConsumer::sendUnchainedFinishedSignal(uint32_t seq, bool handled) {
-    if (mConsumeTimes.find(seq) == mConsumeTimes.end()) {
+    auto it = mConsumeTimes.find(seq);
+    if (it == mConsumeTimes.end()) {
         // Consume time will be missing if either 'finishInputEvent' is called twice,
         // or if it was called for the wrong (synthetic?) input event.
         ALOGW("Could not find consume time for seq=%" PRIu32
         " - likely due to double finishInputEvent call", seq);
-        return BAD_VALUE;
+        return OK;
     }
     InputMessage msg;
     msg.header.type = InputMessage::Type::FINISHED;
@@ -796,7 +797,7 @@ status_t InputConsumer::sendUnchainedFinishedSignal(uint32_t seq, bool handled) 
         // Remove the consume time if the socket write succeeded. We will not need to ack this
         // message anymore. If the socket write did not succeed, we will try again and will still
         // need consume time.
-        popConsumeTime(seq);
+        mConsumeTimes.erase(it);
 
         // Trace the event processing timeline - event was just finished
         ATRACE_ASYNC_END(mProcessingTraceTag.c_str(), /*cookie=*/seq);
