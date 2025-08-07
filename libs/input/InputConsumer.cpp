@@ -218,10 +218,16 @@ bool InputConsumer::isTouchResamplingEnabled() {
 }
 
 status_t InputConsumer::consume(InputEventFactoryInterface* factory, bool consumeBatches,
-                                nsecs_t frameTime, uint32_t* outSeq, InputEvent** outEvent) {
+                               nsecs_t frameTime, uint32_t* outSeq, InputEvent** outEvent) {
     ALOGD_IF(DEBUG_TRANSPORT_CONSUMER,
              "channel '%s' consumer ~ consume: consumeBatches=%s, frameTime=%" PRId64,
              mChannel->getName().c_str(), toString(consumeBatches), frameTime);
+
+    // Additional null pointer check
+    if (factory == nullptr || outSeq == nullptr || outEvent == nullptr) {
+        ALOGE("InputConsumer::consume received null parameters");
+        return BAD_VALUE;
+    }
 
     *outSeq = 0;
     *outEvent = nullptr;
@@ -241,7 +247,7 @@ status_t InputConsumer::consume(InputEventFactoryInterface* factory, bool consum
                 const auto [_, inserted] =
                         mConsumeTimes.emplace(mMsg.header.seq, systemTime(SYSTEM_TIME_MONOTONIC));
                 LOG_ALWAYS_FATAL_IF(!inserted, "Already have a consume time for seq=%" PRIu32,
-                                    mMsg.header.seq);
+                                   mMsg.header.seq);
 
                 // Trace the event processing timeline - event was just read from the socket
                 ATRACE_ASYNC_BEGIN(mProcessingTraceTag.c_str(), /*cookie=*/mMsg.header.seq);
@@ -252,8 +258,8 @@ status_t InputConsumer::consume(InputEventFactoryInterface* factory, bool consum
                             consumeBatch(factory, frameTime, outSeq, outEvent));
                     if (*outEvent) {
                         ALOGD_IF(DEBUG_TRANSPORT_CONSUMER,
-                                 "channel '%s' consumer ~ consumed batch event, seq=%u",
-                                 mChannel->getName().c_str(), *outSeq);
+                                "channel '%s' consumer ~ consumed batch event, seq=%u",
+                                mChannel->getName().c_str(), *outSeq);
                         break;
                     }
                 }
@@ -261,54 +267,122 @@ status_t InputConsumer::consume(InputEventFactoryInterface* factory, bool consum
             }
         }
 
+        // Validate message type before processing to prevent type mismatches
+        if (static_cast<uint32_t>(mMsg.header.type) >
+            static_cast<uint32_t>(InputMessage::Type::TOUCH_MODE)) {
+            ALOGE("Invalid message type: %d", static_cast<int>(mMsg.header.type));
+            return INVALID_OPERATION;
+        }
+
         switch (mMsg.header.type) {
             case InputMessage::Type::KEY: {
                 KeyEvent* keyEvent = factory->createKeyEvent();
                 if (!keyEvent) return NO_MEMORY;
 
+                // Validate key event data before initialization
+                if (mMsg.body.key.keyCode == 0 && mMsg.body.key.action != AKEY_EVENT_ACTION_UP) {
+                    ALOGE("Suspicious key event data detected");
+                }
+
                 initializeKeyEvent(*keyEvent, mMsg);
                 *outSeq = mMsg.header.seq;
                 *outEvent = keyEvent;
                 ALOGD_IF(DEBUG_TRANSPORT_CONSUMER,
-                         "channel '%s' consumer ~ consumed key event, seq=%u",
-                         mChannel->getName().c_str(), *outSeq);
+                        "channel '%s' consumer ~ consumed key event, seq=%u",
+                        mChannel->getName().c_str(), *outSeq);
                 break;
             }
 
             case InputMessage::Type::MOTION: {
+                // Validate motion data before processing
+                if (mMsg.body.motion.pointerCount <= 0 ||
+                    mMsg.body.motion.pointerCount > MAX_POINTERS) {
+                    ALOGE("Invalid pointer count: %d", mMsg.body.motion.pointerCount);
+                    return INVALID_OPERATION;
+                }
+
                 ssize_t batchIndex = findBatch(mMsg.body.motion.deviceId, mMsg.body.motion.source);
                 if (batchIndex >= 0) {
+                    // Validate batch index to prevent out-of-bounds access
+                    if (batchIndex >= static_cast<ssize_t>(mBatches.size())) {
+                        ALOGE("Invalid batch index: %zd >= %zu", batchIndex, mBatches.size());
+                        return INVALID_OPERATION;
+                    }
+
                     Batch& batch = mBatches[batchIndex];
                     if (canAddSample(batch, &mMsg)) {
-                        batch.samples.push_back(mMsg);
+                        // Check if we're at capacity before adding to avoid allocation failures
+                        size_t oldSize = batch.samples.size();
+                        size_t oldCapacity = batch.samples.capacity();
+                        if (oldSize >= oldCapacity && oldCapacity >= batch.samples.max_size()) {
+                            ALOGE("Failed to push_back to batch samples: at max capacity");
+                            return NO_MEMORY;
+                        }
+
+                        // Use copy instead of move to avoid potential issues with moved-from states
+                        InputMessage msgCopy = mMsg;
+                        batch.samples.push_back(msgCopy);
                         ALOGD_IF(DEBUG_TRANSPORT_CONSUMER,
-                                 "channel '%s' consumer ~ appended to batch event",
-                                 mChannel->getName().c_str());
+                                "channel '%s' consumer ~ appended to batch event",
+                                mChannel->getName().c_str());
                         break;
                     } else if (isPointerEvent(mMsg.body.motion.source) &&
-                               mMsg.body.motion.action == AMOTION_EVENT_ACTION_CANCEL) {
+                              mMsg.body.motion.action == AMOTION_EVENT_ACTION_CANCEL) {
                         // No need to process events that we are going to cancel anyways
                         const size_t count = batch.samples.size();
                         for (size_t i = 0; i < count; i++) {
-                            const InputMessage& msg = batch.samples[i];
-                            sendFinishedSignal(msg.header.seq, false);
+                            // Additional check to avoid out-of-bounds access
+                            if (i < batch.samples.size()) {
+                                const InputMessage& msg = batch.samples[i];
+                                sendFinishedSignal(msg.header.seq, false);
+                            }
                         }
-                        batch.samples.erase(batch.samples.begin(), batch.samples.begin() + count);
-                        mBatches.erase(mBatches.begin() + batchIndex);
+
+                        // Validate before erasing to prevent crashes
+                        if (count > batch.samples.size()) {
+                            ALOGE("Invalid sample count: %zu > %zu", count, batch.samples.size());
+                        } else if (count > 0) {  // Ensure count > 0
+                            batch.samples.erase(batch.samples.begin(), batch.samples.begin() + count);
+                        }
+
+                        // Double check batch index is still valid
+                        if (batchIndex >= 0 && batchIndex < static_cast<ssize_t>(mBatches.size())) {
+                            mBatches.erase(mBatches.begin() + batchIndex);
+                        } else {
+                            ALOGE("Invalid batch index for erase: %zd", batchIndex);
+                        }
                     } else {
                         // We cannot append to the batch in progress, so we need to consume
                         // the previous batch right now and defer the new message until later.
                         mMsgDeferred = true;
+
+                        // Verify batch has samples before consuming
+                        if (batch.samples.empty()) {
+                            ALOGE("Attempting to consume empty batch");
+                            // Skip this batch and continue
+                            if (batchIndex >= 0 && batchIndex < static_cast<ssize_t>(mBatches.size())) {
+                                mBatches.erase(mBatches.begin() + batchIndex);
+                            }
+                            break;
+                        }
+
                         status_t result = consumeSamples(factory, batch, batch.samples.size(),
-                                                         outSeq, outEvent);
-                        mBatches.erase(mBatches.begin() + batchIndex);
+                                                       outSeq, outEvent);
+
+                        // Validate batch index is still valid before erasing
+                        if (batchIndex >= 0 && batchIndex < static_cast<ssize_t>(mBatches.size())) {
+                            mBatches.erase(mBatches.begin() + batchIndex);
+                        } else {
+                            ALOGE("Invalid batch index for erase: %zd", batchIndex);
+                        }
+
                         if (result) {
                             return result;
                         }
                         ALOGD_IF(DEBUG_TRANSPORT_CONSUMER,
-                                 "channel '%s' consumer ~ consumed batch event and "
-                                 "deferred current event, seq=%u",
-                                 mChannel->getName().c_str(), *outSeq);
+                                "channel '%s' consumer ~ consumed batch event and "
+                                "deferred current event, seq=%u",
+                                mChannel->getName().c_str(), *outSeq);
                         break;
                     }
                 }
@@ -316,17 +390,39 @@ status_t InputConsumer::consume(InputEventFactoryInterface* factory, bool consum
                 // Start a new batch if needed.
                 if (mMsg.body.motion.action == AMOTION_EVENT_ACTION_MOVE ||
                     mMsg.body.motion.action == AMOTION_EVENT_ACTION_HOVER_MOVE) {
+                    // Check vector capacity before adding a new batch
+                    if (mBatches.size() >= mBatches.max_size()) {
+                        ALOGE("Failed to add batch: at max capacity");
+                        return NO_MEMORY;
+                    }
+
                     Batch batch;
-                    batch.samples.push_back(mMsg);
+                    // Check vector capacity before adding samples to the batch
+                    if (batch.samples.size() >= batch.samples.capacity() &&
+                        batch.samples.capacity() >= batch.samples.max_size()) {
+                        ALOGE("Failed to push_back to new batch: at max capacity");
+                        return NO_MEMORY;
+                    }
+
+                    // Use copy instead of move to avoid potential issues with moved-from states
+                    InputMessage msgCopy = mMsg;
+                    batch.samples.push_back(msgCopy);
                     mBatches.push_back(batch);
                     ALOGD_IF(DEBUG_TRANSPORT_CONSUMER,
-                             "channel '%s' consumer ~ started batch event",
-                             mChannel->getName().c_str());
+                            "channel '%s' consumer ~ started batch event",
+                            mChannel->getName().c_str());
                     break;
                 }
 
                 MotionEvent* motionEvent = factory->createMotionEvent();
                 if (!motionEvent) return NO_MEMORY;
+
+                // Add extra validation before initializing
+                if (mMsg.body.motion.action < 0 ||
+                    mMsg.body.motion.actionButton < 0) {
+                    ALOGE("Invalid motion event data detected");
+                    // Continue with initialization anyway, but log the issue
+                }
 
                 updateTouchState(mMsg);
                 initializeMotionEvent(*motionEvent, mMsg);
@@ -334,17 +430,17 @@ status_t InputConsumer::consume(InputEventFactoryInterface* factory, bool consum
                 *outEvent = motionEvent;
 
                 ALOGD_IF(DEBUG_TRANSPORT_CONSUMER,
-                         "channel '%s' consumer ~ consumed motion event, seq=%u",
-                         mChannel->getName().c_str(), *outSeq);
+                        "channel '%s' consumer ~ consumed motion event, seq=%u",
+                        mChannel->getName().c_str(), *outSeq);
                 break;
             }
 
             case InputMessage::Type::FINISHED:
             case InputMessage::Type::TIMELINE: {
                 LOG(FATAL) << "Consumed a " << ftl::enum_string(mMsg.header.type)
-                           << " message, which should never be seen by "
-                              "InputConsumer on "
-                           << mChannel->getName();
+                          << " message, which should never be seen by "
+                            "InputConsumer on "
+                          << mChannel->getName();
                 break;
             }
 
@@ -387,6 +483,13 @@ status_t InputConsumer::consume(InputEventFactoryInterface* factory, bool consum
                 *outEvent = touchModeEvent;
                 break;
             }
+
+            default: {
+                // This should never happen due to our type validation above,
+                // but handle it anyway to avoid switch-case issues
+                ALOGE("Unknown message type: %d", static_cast<int>(mMsg.header.type));
+                return INVALID_OPERATION;
+            }
         }
     }
     return OK;
@@ -394,45 +497,105 @@ status_t InputConsumer::consume(InputEventFactoryInterface* factory, bool consum
 
 status_t InputConsumer::consumeBatch(InputEventFactoryInterface* factory, nsecs_t frameTime,
                                      uint32_t* outSeq, InputEvent** outEvent) {
+    // Input parameter validation
+    if (factory == nullptr || outSeq == nullptr || outEvent == nullptr) {
+        ALOGE("InputConsumer::consumeBatch received null parameters");
+        return BAD_VALUE;
+    }
+
+    *outSeq = 0;
+    *outEvent = nullptr;
+
+    // Check if there are any batches at all
+    if (mBatches.empty()) {
+        return WOULD_BLOCK;
+    }
+
     status_t result;
     for (size_t i = mBatches.size(); i > 0;) {
         i--;
-        Batch& batch = mBatches[i];
-        if (frameTime < 0) {
-            result = consumeSamples(factory, batch, batch.samples.size(), outSeq, outEvent);
-            if (!mBatches.empty()) {  // Add safety check before erasing
-                mBatches.erase(mBatches.begin() + i);
-            } else {
-                ALOGW("Attempted to erase from empty batch vector in consumeBatch");
-            }
-            return result;
+
+        // Safety check to prevent out-of-bounds access
+        if (i >= mBatches.size()) {
+            ALOGE("Invalid batch index: %zu >= %zu", i, mBatches.size());
+            continue;
         }
 
+        Batch& batch = mBatches[i];
+
+        // Check if batch has samples
+        if (batch.samples.empty()) {
+            ALOGW("Empty batch found at index %zu, removing", i);
+            // Use a local variable to check if batch index is still valid
+            if (i < mBatches.size()) {
+                mBatches.erase(mBatches.begin() + i);
+            } else {
+                ALOGE("Batch index became invalid during processing: %zu", i);
+            }
+            continue;
+        }
+
+        if (frameTime < 0) {
+            // Process the entire batch
+            result = consumeSamples(factory, batch, batch.samples.size(), outSeq, outEvent);
+
+            // Safety check before erasing batch
+            if (i < mBatches.size()) {
+                mBatches.erase(mBatches.begin() + i);
+            } else {
+                ALOGW("Batch index %zu no longer valid after consumeSamples", i);
+            }
+
+            // Return immediately if we got a valid event or an error
+            if (result != OK || *outEvent != nullptr) {
+                return result;
+            }
+            continue;  // Try next batch if this one didn't produce an event
+        }
+
+        // Process a specific portion of the batch
         nsecs_t sampleTime = frameTime;
         if (mResampleTouch) {
             sampleTime -= std::chrono::nanoseconds(RESAMPLE_LATENCY).count();
         }
+
         ssize_t split = findSampleNoLaterThan(batch, sampleTime);
         if (split < 0) {
-            continue;
+            continue;  // No samples to process in this batch
         }
 
+        // Validate split index
+        if (split >= static_cast<ssize_t>(batch.samples.size())) {
+            ALOGE("Invalid split index: %zd >= %zu", split, batch.samples.size());
+            split = batch.samples.size() - 1;  // Adjust to prevent out of bounds access
+        }
+
+        // Process samples up to split point
         result = consumeSamples(factory, batch, split + 1, outSeq, outEvent);
-        const InputMessage* next;
-        if (batch.samples.empty()) {
-            if (!mBatches.empty()) {
-                mBatches.erase(mBatches.begin() + i);
-            } else {
-                ALOGW("Attempted to erase from empty batch vector in consumeBatch");
-            }
-            next = nullptr;
-        } else {
+
+        // Store next sample (if any) before potentially modifying the batch
+        const InputMessage* next = nullptr;
+        if (!batch.samples.empty()) {
             next = &batch.samples[0];
         }
-        if (!result && mResampleTouch) {
-            resampleTouchState(sampleTime, static_cast<MotionEvent*>(*outEvent), next);
+
+        // Check if batch is now empty
+        if (batch.samples.empty() && i < mBatches.size()) {
+            mBatches.erase(mBatches.begin() + i);
         }
-        return result;
+
+        // Apply touch resampling if needed
+        if (result == OK && *outEvent != nullptr && mResampleTouch) {
+            MotionEvent* motionEvent = static_cast<MotionEvent*>(*outEvent);
+            if (motionEvent != nullptr) {  // Double-check the cast worked
+                resampleTouchState(sampleTime, motionEvent, next);
+            }
+        }
+
+        // Return if we got an event or encountered an error
+        if (result != OK || *outEvent != nullptr) {
+            return result;
+        }
     }
 
     return WOULD_BLOCK;
